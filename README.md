@@ -4,38 +4,41 @@
 
 ## ✨ 功能特性
 
-- **多 Agent 架构**: Router + 专业化 Agents 协作架构，通过 LangGraph 条件边动态路由
-- **情感感知**: Transformers distilbert 模型 + 关键词回退双层策略，情绪驱动回复风格
-- **向量记忆**: ChromaDB 持久化存储，跨会话个性化推荐
-- **8 个自定义工具**:
-  - 编程工具: execute_python_code, format_python_code, analyze_code_complexity, extract_code_features
-  - 求职工具: evaluate_resume, get_interview_questions, recommend_companies, generate_learning_path
+- **多 Agent 架构**: Router + 5 个专业化 Agents 协作架构，通过 LangGraph 条件边动态路由
+- **智能分类**: OpenAI Embedding API 向量相似度检测 + 代码特征识别 + 关键词回退三层策略，结合用户行为分析动态调整分类
+- **向量记忆**: ChromaDB 持久化存储，实现语义检索、记忆权重衰减（时间衰减 + 频率加权）、主动记忆推送（根据情绪状态）、记忆压缩
+- **MCP 协议集成**:
+  - CodingAgent: 代码执行沙箱、LeetCode 题目获取、GitHub 代码搜索
+  - CareerAgent: 真实岗位信息、ATS 简历评分、真实面经
+- **情绪关怀**: 基于历史情绪趋势的分级关怀机制，连续低落触发深度关怀
 - **前后端分离**: FastAPI 后端 + Streamlit 前端
-- **情绪关怀**: 基于历史情绪趋势的分级关怀机制
 
 ## 🛠️ 技术栈
 
-Python | LangGraph | LangChain | ChromaDB | Transformers | FastAPI | Streamlit | Plotly | Uvicorn
+Python | LangGraph | LangChain | ChromaDB | OpenAI Embedding API | MCP 协议 | FastAPI | Streamlit | Plotly | Uvicorn
 
 ## 📐 架构设计
 
 ```
 用户消息 → GuardAgent (Router)
-             ├─ 情感分析: Transformers + 关键词回退
-             ├─ 消息分类: 代码检测 + 关键词评分
+             ├─ 情感分析: 规则引擎 + 关键词匹配
+             ├─ 消息分类: 向量相似度 + 代码检测 + 关键词回退
+             ├─ 行为分析: 输入频率、消息长度、时间段
              └─ 动态路由
           MemoryAgent
-             ├─ ChromaDB 检索 top-3 相关记忆
+             ├─ ChromaDB 向量检索 top-3 相关记忆（权重衰减）
+             ├─ 主动记忆推送（根据情绪状态）
              ├─ 获取/更新用户画像
-             └─ 存储当前对话 + 更新情绪趋势
+             └─ 存储当前对话 + 更新情绪趋势 + 记忆压缩
        ┌──── 条件路由 ────┐
        ↓         ↓         ↓
   CodingAgent  CareerAgent  GeneralChat
        └────┬────────┬────┘
             ↓
-       EmotionAgent (分级关怀)
-            ↓
-       Synthesizer (拼接 + 记忆同步)
+    ResponseComposer
+       ├─ 情绪关怀（基于历史趋势分级）
+       ├─ 拼接专业回复
+       └─ 存储记忆
             ↓
          最终回复
 ```
@@ -53,7 +56,21 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 复制 `.env.example` 为 `.env` 并配置：
 
 ```env
+# LLM 配置
 OPENAI_API_KEY=你的API密钥
+OPENAI_BASE_URL=你的API地址
+OPENAI_MODEL=你的模型名称
+
+# Embedding 配置（可选，用于向量分类）
+EMBEDDING_API_KEY=你的Embedding API密钥
+EMBEDDING_BASE_URL=你的Embedding API地址
+EMBEDDING_MODEL=text-embedding-v3
+
+# MCP 配置（可选，用于外部工具集成）
+MCP_ENABLED=true
+CODE_SANDBOX_API_URL=你的代码沙箱地址
+LEETCODE_API_URL=你的LeetCode API地址
+GITHUB_API_TOKEN=你的GitHub Token
 ```
 
 ### 3. 启动项目
@@ -78,17 +95,18 @@ python start_all.py
 ```
 CompanionAI/
 ├── companion_ai/
-│   ├── agents/                 # 6 个专业化 Agent
-│   │   ├── guard_agent.py      # Router 感知
-│   │   ├── memory_agent.py     # 向量检索
-│   │   ├── coding_agent.py     # 编程辅导
-│   │   ├── career_agent.py     # 求职咨询
-│   │   ├── emotion_agent.py    # 情绪关怀
-│   │   └── synthesizer.py      # 合成输出
-│   ├── tools/                  # 8 个自定义工具
+│   ├── agents/                 # 5 个专业化 Agent
+│   │   ├── guard_agent.py      # Router: 情感分析 + 分类 + 行为分析
+│   │   ├── memory_agent.py     # 向量检索 + 记忆管理
+│   │   ├── coding_agent.py     # 编程辅导 + MCP 工具
+│   │   ├── career_agent.py     # 求职辅导 + MCP 工具
+│   │   ├── behavior_analyzer.py# 用户行为分析器
+│   │   └── response_composer.py# 响应合成: 情绪关怀 + 回复拼接
+│   ├── tools/                  # 自定义工具 + MCP 工具
 │   │   ├── python_executor.py  # 代码执行
-│   │   ├── code_analyzer.py    # 代码分析
-│   │   └── career_tools.py     # 求职工具
+│   │   ├── career_tools.py     # 求职工具
+│   │   ├── mcp_tools.py        # CodingAgent MCP 工具
+│   │   └── career_mcp_tools.py # CareerAgent MCP 工具
 │   ├── graph/                  # LangGraph 定义
 │   │   ├── state.py            # 状态定义
 │   │   └── workflow.py         # 工作流构建
@@ -96,6 +114,8 @@ CompanionAI/
 │   │   └── vector_store.py
 │   ├── emotion/                # 情感分析
 │   │   └── sentiment_analyzer.py
+│   ├── data/                   # 分类种子数据
+│   │   └── classification_seeds.json
 │   ├── backend/                # FastAPI 后端
 │   │   └── main.py
 │   ├── frontend/               # Streamlit 前端
@@ -104,6 +124,7 @@ CompanionAI/
 │       ├── config.py
 │       ├── logger.py
 │       └── helpers.py
+├── classification_seeds.md     # 分类种子说明文档
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -115,19 +136,34 @@ CompanionAI/
 
 ### 1. Router + 专业化 Agents 架构
 
-使用 LangGraph 构建有向图，`add_conditional_edges` 实现基于消息类别的动态路由，将单 Agent 的复杂提示词拆解为专业化分工。
+使用 LangGraph 构建有向图，`add_conditional_edges` 实现基于消息类别的动态路由，将单 Agent 的复杂提示词拆解为 5 个专业化 Agent 分工协作，避免提示词膨胀。
 
-### 2. 情感感知前置机制
+### 2. 多模态消息分类
 
-在 GuardAgent 层完成情感分析，采用 Transformers distilbert 模型 + 中英文关键词回退双层策略，让所有后续 Agent 都能感知用户情绪并调整回复风格。
+GuardAgent 采用三层分类策略：OpenAI Embedding API 向量相似度检测（主方案）+ 代码特征识别 + 关键词回退（兜底），结合用户行为分析（输入频率、消息长度、时间段）动态调整分类结果，解决传统关键词匹配无法理解语义和同义词的痛点。
 
-### 3. 向量记忆系统
+### 3. 智能记忆系统
 
-使用 ChromaDB PersistentClient 持久化存储对话历史与用户画像，通过语义检索实现跨会话的个性化推荐。
+使用 ChromaDB PersistentClient 持久化存储对话历史与用户画像，实现：
+- **语义检索**: 基于向量相似度，支持用户隔离
+- **记忆权重衰减**: 时间衰减 + 使用频率加权，模拟人类遗忘曲线
+- **主动记忆推送**: 根据用户当前情绪状态推送相关记忆
+- **记忆压缩**: 定期摘要总结，控制存储增长
 
-### 4. 自定义工具集成
+### 4. MCP 协议集成
 
-开发 8 个自定义工具，使用 `@tool` 装饰器定义，Agent 可在回复中主动推荐工具使用。
+通过 Model Context Protocol 接入外部应用，增强 Agent 能力：
+- **CodingAgent**: 代码执行沙箱（安全验证）、LeetCode 题目获取（真实题库）、GitHub 代码搜索（项目参考）
+- **CareerAgent**: 真实岗位信息、ATS 简历评分、真实面经
+- **智能回退**: MCP 不可用时自动切换本地工具，确保系统鲁棒性
+
+### 5. 情绪关怀机制
+
+ResponseComposer 基于历史情绪趋势的分级关怀：
+- 连续低落超过 3 次 → 深度关怀
+- 当前负面情绪 → 分级鼓励（根据情绪强度）
+- 积极情绪 → 祝贺保持
+- 结合消息类别调整关怀内容，打造有"温度"的 AI 交互体验
 
 ## 📝 许可证
 
