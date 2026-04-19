@@ -1,0 +1,325 @@
+"""
+FastAPI 后端服务 —— main.py
+
+职责：
+  提供 RESTful API 接口，将 CompanionAI 的核心功能暴露为 Web 服务：
+    - /api/chat: 处理用户消息，返回 AI 回复
+    - /api/chat/stream: 流式返回 AI 回复
+    - /api/conversations: 获取对话历史列表
+    - /api/conversations/{id}: 获取/保存/删除特定对话
+    - /api/profile: 获取/更新用户画像
+    - /api/memories: 检索相关记忆
+    - /api/report: 生成日报
+
+设计理由：
+  - 采用前后端分离架构，后端提供 API，前端负责展示
+  - 使用 FastAPI 高性能异步框架，支持流式输出
+  - 自动生成 OpenAPI 文档，方便前端开发和调试
+  - CORS 配置支持跨域请求
+"""
+
+import os
+import sys
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from companion_ai.graph.workflow import run_workflow, run_daily_report
+from companion_ai.memory.vector_store import vector_store
+from companion_ai.utils.config import settings
+from companion_ai.utils.logger import logger
+
+
+app = FastAPI(
+    title="CompanionAI API",
+    description="多 Agent 协作的智能聊天伙伴系统 API",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    user_id: str = Field(default=settings.DEFAULT_USER_ID, description="用户 ID")
+    message: str = Field(..., description="用户消息")
+    thread_id: Optional[str] = Field(None, description="对话线程 ID")
+    interview_mode: bool = Field(default=False, description="是否开启模拟面试模式")
+
+
+class ChatResponse(BaseModel):
+    success: bool
+    final_response: str
+    emotion_label: str
+    emotion_score: float
+    message_category: str
+
+
+class UserProfile(BaseModel):
+    learning_goal: Optional[str] = None
+    current_skill_level: Optional[str] = None
+    job_target: Optional[str] = None
+    custom_fields: Optional[Dict[str, Any]] = None
+
+
+class ConversationItem(BaseModel):
+    id: str
+    name: str
+    timestamp: str
+    message_count: int
+    user_id: str
+
+
+def get_conversations_dir():
+    return os.path.join(os.path.dirname(__file__), "..", "..", "conversations")
+
+
+def load_saved_conversations(user_id: Optional[str] = None) -> List[ConversationItem]:
+    save_dir = get_conversations_dir()
+    if not os.path.exists(save_dir):
+        return []
+    
+    conversations = []
+    for filename in os.listdir(save_dir):
+        if filename.endswith(".json"):
+            filepath = os.path.join(save_dir, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    conv_user_id = data.get("user_id", "")
+                    if user_id and conv_user_id != user_id:
+                        continue
+                    conversations.append(ConversationItem(
+                        id=filename.replace(".json", ""),
+                        name=data.get("name", filename),
+                        timestamp=data.get("timestamp", ""),
+                        message_count=len(data.get("chat_history", [])),
+                        user_id=conv_user_id,
+                    ))
+            except Exception as e:
+                logger.error(f"加载对话失败: {e}")
+    
+    conversations.sort(key=lambda x: x.timestamp, reverse=True)
+    return conversations
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "CompanionAI",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+    }
+
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """处理用户消息，返回 AI 回复"""
+    try:
+        logger.info(f"API /api/chat | user={request.user_id} | 收到请求")
+        
+        result = run_workflow(
+            user_id=request.user_id,
+            message=request.message,
+            thread_id=request.thread_id or f"thread_{request.user_id}",
+            interview_mode=request.interview_mode,
+        )
+        
+        response = ChatResponse(
+            success=True,
+            final_response=result.get("final_response", ""),
+            emotion_label=result.get("emotion_label", "neutral"),
+            emotion_score=result.get("emotion_score", 0.5),
+            message_category=result.get("message_category", ""),
+        )
+        
+        logger.info(f"API /api/chat | user={request.user_id} | 响应成功")
+        return response
+    except Exception as e:
+        logger.error(f"API /api/chat | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """流式返回 AI 回复"""
+    try:
+        logger.info(f"API /api/chat/stream | user={request.user_id} | 收到请求")
+        
+        result = run_workflow(
+            user_id=request.user_id,
+            message=request.message,
+            thread_id=request.thread_id or f"thread_{request.user_id}",
+            interview_mode=request.interview_mode,
+        )
+        
+        final_response = result.get("final_response", "")
+        emotion_label = result.get("emotion_label", "neutral")
+        emotion_score = result.get("emotion_score", 0.5)
+        message_category = result.get("message_category", "")
+        
+        async def generate():
+            for char in final_response:
+                yield char
+                import asyncio
+                await asyncio.sleep(0.01)
+            
+            yield f"\n\n__META__:{json.dumps({'emotion': emotion_label, 'category': message_category}, ensure_ascii=False)}"
+        
+        return StreamingResponse(
+            generate(),
+            media_type="text/plain",
+        )
+    except Exception as e:
+        logger.error(f"API /api/chat/stream | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/conversations")
+async def get_conversations(user_id: Optional[str] = None):
+    """获取对话列表"""
+    try:
+        conversations = load_saved_conversations(user_id)
+        return {
+            "success": True,
+            "count": len(conversations),
+            "conversations": conversations,
+        }
+    except Exception as e:
+        logger.error(f"API /api/conversations | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """获取特定对话"""
+    save_dir = get_conversations_dir()
+    filepath = os.path.join(save_dir, f"{conversation_id}.json")
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="对话不存在")
+    
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"success": True, "data": data}
+    except Exception as e:
+        logger.error(f"API /api/conversations/{conversation_id} | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/conversations/{conversation_id}")
+async def save_conversation(conversation_id: str, request: Request):
+    """保存对话"""
+    save_dir = get_conversations_dir()
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, f"{conversation_id}.json")
+    
+    try:
+        data = await request.json()
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return {"success": True, "id": conversation_id}
+    except Exception as e:
+        logger.error(f"API /api/conversations/{conversation_id} | 保存失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """删除对话"""
+    save_dir = get_conversations_dir()
+    filepath = os.path.join(save_dir, f"{conversation_id}.json")
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="对话不存在")
+    
+    try:
+        os.remove(filepath)
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"API /api/conversations/{conversation_id} | 删除失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/profile/{user_id}")
+async def get_profile(user_id: str):
+    """获取用户画像"""
+    try:
+        profile = vector_store.get_user_profile(user_id)
+        return {"success": True, "user_id": user_id, "profile": profile}
+    except Exception as e:
+        logger.error(f"API /api/profile/{user_id} | 处理失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/profile/{user_id}")
+async def save_profile(user_id: str, profile: UserProfile):
+    """保存用户画像"""
+    try:
+        existing = vector_store.get_user_profile(user_id)
+        
+        if profile.learning_goal:
+            existing["learning_goal"] = profile.learning_goal
+        if profile.current_skill_level:
+            existing["current_skill_level"] = profile.current_skill_level
+        if profile.job_target:
+            existing["job_target"] = profile.job_target
+        if profile.custom_fields:
+            existing.update(profile.custom_fields)
+        
+        vector_store.save_user_profile(user_id, existing)
+        return {"success": True, "user_id": user_id, "profile": existing}
+    except Exception as e:
+        logger.error(f"API /api/profile/{user_id} | 保存失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/memories/{user_id}")
+async def retrieve_memories(user_id: str, query: str, top_k: int = 3):
+    """检索相关记忆"""
+    try:
+        memories = vector_store.retrieve_memories(user_id, query, top_k=top_k)
+        return {"success": True, "user_id": user_id, "memories": memories}
+    except Exception as e:
+        logger.error(f"API /api/memories/{user_id} | 检索失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/report/{user_id}")
+async def generate_report(user_id: str):
+    """生成日报"""
+    try:
+        report = run_daily_report(user_id)
+        return {"success": True, "user_id": user_id, "report": report}
+    except Exception as e:
+        logger.error(f"API /api/report/{user_id} | 生成失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def run_backend(host: str = "0.0.0.0", port: int = 8000):
+    """启动 FastAPI 后端服务"""
+    import uvicorn
+    logger.info(f"启动 FastAPI 后端服务 | host={host}, port={port}")
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    run_backend()
